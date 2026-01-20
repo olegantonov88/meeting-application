@@ -25,3 +25,7 @@ Route::prefix('test/efrsb-pdf')->group(function () {
     Route::post('/generate', [TestEfrsbPdfGenerationController::class, 'testGeneratePdf'])->name('api.test.efrsb-pdf.generate');
     Route::get('/message-info', [TestEfrsbPdfGenerationController::class, 'getMessageInfo'])->name('api.test.efrsb-pdf.message-info');
 });
+
+Route::get('/ping', function () {
+    return response()->json(['message' => 'pong']);
+});
