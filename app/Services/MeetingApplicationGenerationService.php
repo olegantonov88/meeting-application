@@ -184,7 +184,64 @@ class MeetingApplicationGenerationService
             // 9. Сохранить итоговый файл
             $filename = 'meeting_application_' . $application->id . '_' . now('Europe/Moscow')->format('Y-m-d_H-i-s') . '.pdf';
 
-            $fileRecord = $this->fileStorageService->uploadFile($application, $mergedPdfPath, $filename, $userId);
+            try {
+                $fileRecord = $this->fileStorageService->uploadFile($application, $mergedPdfPath, $filename, $userId);
+            } catch (\Exception $uploadException) {
+                // Очистка временных файлов при ошибке загрузки
+                $this->cleanupTempFiles($tempFiles);
+
+                // Получаем свежую версию приложения из БД для обновления статуса
+                $applicationId = $application->id;
+                try {
+                    $application = MeetingApplication::find($applicationId);
+                    if ($application) {
+                        // Установить статус ошибки
+                        $application->latest_status = MeetingApplicationStatus::ERROR;
+                        $application->end_generation = now();
+                        $application->addStatus(MeetingApplicationStatus::ERROR, 'Ошибка загрузки сгенерированного файла', "Ошибка загрузки файла: {$uploadException->getMessage()}");
+                        $application->save();
+                    }
+                } catch (\Exception $saveException) {
+                    Log::error('Failed to save application status to ERROR after upload failure', [
+                        'application_id' => $applicationId,
+                        'save_error' => $saveException->getMessage(),
+                    ]);
+                }
+
+                // Обновляем статус задачи на ERROR
+                if ($generationTask) {
+                    $generationTask->update([
+                        'status' => MeetingApplicationGenerationTaskStatus::ERROR,
+                        'finished_at' => now(),
+                    ]);
+                }
+
+                // Логируем ошибку
+                Log::error('Failed to upload meeting application file', [
+                    'application_id' => $applicationId,
+                    'error' => $uploadException->getMessage(),
+                    'trace' => $uploadException->getTraceAsString(),
+                ]);
+
+                // Отправляем уведомление об ошибке через Pusher
+                if ($application && $userId) {
+                    event(new MeetingApplicationStatusUpdated(
+                        userId: $userId,
+                        meetingApplication: $application->fresh()
+                    ));
+
+                    event(new MeetingApplicationStatusNotification(
+                        userId: $userId,
+                        title: 'Ошибка генерации приложения',
+                        message: 'Не удалось загрузить файл приложения к собранию',
+                        type: 'error',
+                        life: 6000
+                    ));
+                }
+
+                // Пробрасываем исключение дальше, чтобы оно было обработано внешним catch блоком
+                throw $uploadException;
+            }
 
             // Сохраняем количество страниц в meta приложения
             if ($pageCount !== null) {
