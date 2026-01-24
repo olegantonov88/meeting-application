@@ -46,6 +46,12 @@ class MeetingApplicationGenerationService
      */
     public function generate(int $meetingApplicationId, bool $continueAfterCallback = false, ?int $userId = null): void
     {
+        Log::info('Starting meeting application generation', [
+            'application_id' => $meetingApplicationId,
+            'continue_after_callback' => $continueAfterCallback,
+            'user_id' => $userId,
+        ]);
+
         $application = MeetingApplication::find($meetingApplicationId);
         if (!$application) {
             throw new \Exception("Приложение к собранию не найдено: {$meetingApplicationId}");
@@ -56,12 +62,21 @@ class MeetingApplicationGenerationService
 
         try {
             // 1. Создаем или получаем задачу генерации
+            Log::debug('Step 1: Creating or retrieving generation task', [
+                'application_id' => $application->id,
+                'continue_after_callback' => $continueAfterCallback,
+            ]);
+
             if (!$continueAfterCallback) {
                 $generationTask = MeetingApplicationGenerationTask::create([
                     'meeting_application_id' => $application->id,
                     'user_id' => $userId,
                     'started_at' => now(),
                     'status' => MeetingApplicationGenerationTaskStatus::GENERATING,
+                ]);
+                Log::info('Generation task created', [
+                    'task_id' => $generationTask->id,
+                    'application_id' => $application->id,
                 ]);
             } else {
                 // При продолжении после callback ищем существующую задачу
@@ -74,10 +89,21 @@ class MeetingApplicationGenerationService
                     $generationTask->update([
                         'status' => MeetingApplicationGenerationTaskStatus::GENERATING,
                     ]);
+                    Log::info('Generation task resumed', [
+                        'task_id' => $generationTask->id,
+                        'application_id' => $application->id,
+                    ]);
+                } else {
+                    Log::warning('Generation task not found when continuing after callback', [
+                        'application_id' => $application->id,
+                    ]);
                 }
             }
 
             // 2. Сбрасываем статусы и ошибки всех файлов перед началом генерации
+            Log::debug('Step 2: Resetting file and message statuses', [
+                'application_id' => $application->id,
+            ]);
             $this->resetFileStatuses($application);
 
             // Сбрасываем статусы и ошибки всех ЕФРСБ сообщений перед началом генерации
@@ -86,14 +112,34 @@ class MeetingApplicationGenerationService
             $application->save();
 
             // 3. Получить список файлов из arbitrator_files и скачать их
+            Log::debug('Step 3: Downloading arbitrator files', [
+                'application_id' => $application->id,
+            ]);
             $downloadedFiles = $this->downloadArbitratorFiles($application, $generationTask);
             $tempFiles = array_merge($tempFiles, array_column($downloadedFiles, 'path'));
+            
+            Log::info('Arbitrator files downloaded', [
+                'application_id' => $application->id,
+                'files_count' => count($downloadedFiles),
+            ]);
 
             // 4. Получить список сообщений из efrsb_debtor_messages
+            Log::debug('Step 4: Getting EFRSB debtor messages', [
+                'application_id' => $application->id,
+            ]);
             $messages = $this->getEfrsbDebtorMessages($application);
+            
+            Log::info('EFRSB messages retrieved', [
+                'application_id' => $application->id,
+                'messages_count' => $messages->count(),
+            ]);
 
             // 5. Для сообщений без body_html - отправить запрос в efrsb-debtor-message
             // 6. Ожидать получения body_html (с таймаутом 5 минут)
+            Log::debug('Step 5-6: Processing EFRSB messages', [
+                'application_id' => $application->id,
+                'continue_after_callback' => $continueAfterCallback,
+            ]);
             if ($continueAfterCallback) {
                 // Продолжаем генерацию после получения callback - обрабатываем только сообщения с body_html
                 $messagePdfs = $this->generatePdfsFromReadyMessages($application, $messages, $generationTask);
@@ -101,16 +147,81 @@ class MeetingApplicationGenerationService
                 $messagePdfs = $this->processEfrsbMessages($application, $messages, $generationTask);
             }
             $tempFiles = array_merge($tempFiles, array_column($messagePdfs, 'path'));
+            
+            Log::info('EFRSB messages processed', [
+                'application_id' => $application->id,
+                'pdfs_generated' => count($messagePdfs),
+            ]);
 
             // Проверяем, есть ли ожидающие запросы на получение body_html
             // Если есть, выходим и ждем callback, даже если уже есть файлы или сообщения
+            Log::debug('Step 7: Checking for pending EFRSB message requests', [
+                'application_id' => $application->id,
+            ]);
+            
+            // #region agent log
+            // Проверяем pending запросы и исключаем те, для которых уже есть body_html
+            $allPendingRequests = DB::table('efrsb_message_requests')
+                ->where('meeting_application_id', $application->id)
+                ->where('status', EfrsbMessageRequestStatus::PENDING->value)
+                ->get();
+            
+            Log::debug('All pending requests found', [
+                'application_id' => $application->id,
+                'total_pending' => $allPendingRequests->count(),
+                'request_ids' => $allPendingRequests->pluck('message_id')->toArray(),
+            ]);
+            
+            // Проверяем, какие из pending запросов уже имеют body_html
+            $pendingMessageIds = $allPendingRequests->pluck('message_id')->toArray();
+            $messagesWithBody = EfrsbDebtorMessage::whereIn('id', $pendingMessageIds)
+                ->whereNotNull('body_html')
+                ->where('body_html', '!=', '')
+                ->pluck('id')
+                ->toArray();
+            
+            Log::debug('Pending requests with body_html found', [
+                'application_id' => $application->id,
+                'messages_with_body' => $messagesWithBody,
+            ]);
+            
+            // Обновляем статус запросов для сообщений, у которых уже есть body_html
+            if (!empty($messagesWithBody)) {
+                $updated = DB::table('efrsb_message_requests')
+                    ->where('meeting_application_id', $application->id)
+                    ->whereIn('message_id', $messagesWithBody)
+                    ->where('status', EfrsbMessageRequestStatus::PENDING->value)
+                    ->update([
+                        'status' => EfrsbMessageRequestStatus::COMPLETED->value,
+                        'updated_at' => now(),
+                    ]);
+                
+                Log::info('Cleaned up pending requests for messages with body_html', [
+                    'application_id' => $application->id,
+                    'updated_count' => $updated,
+                    'message_ids' => $messagesWithBody,
+                ]);
+            }
+            // #endregion
+            
             $pendingCount = DB::table('efrsb_message_requests')
                 ->where('meeting_application_id', $application->id)
                 ->where('status', EfrsbMessageRequestStatus::PENDING->value)
                 ->count();
 
+            Log::info('Pending EFRSB requests check', [
+                'application_id' => $application->id,
+                'pending_count' => $pendingCount,
+            ]);
+
             if ($pendingCount > 0) {
                 // Есть ожидающие сообщения, выходим и ждем callback
+                Log::info('Exiting generation - waiting for EFRSB callbacks', [
+                    'application_id' => $application->id,
+                    'pending_count' => $pendingCount,
+                    'downloaded_files_count' => count($downloadedFiles),
+                    'message_pdfs_count' => count($messagePdfs),
+                ]);
                 return;
             }
 
@@ -134,6 +245,12 @@ class MeetingApplicationGenerationService
             }
 
             // 7. Объединить все PDF файлы
+            Log::debug('Step 8: Merging PDF files', [
+                'application_id' => $application->id,
+                'downloaded_files_count' => count($downloadedFiles),
+                'message_pdfs_count' => count($messagePdfs),
+            ]);
+
             $allPdfFiles = array_merge(
                 array_column($downloadedFiles, 'path'),
                 array_column($messagePdfs, 'path')
@@ -145,6 +262,12 @@ class MeetingApplicationGenerationService
 
             $mergedPdfPath = $this->getTempFilePath('merged_' . $application->id . '.pdf');
 
+            Log::info('Starting PDF merge', [
+                'application_id' => $application->id,
+                'files_to_merge' => count($allPdfFiles),
+                'output_path' => $mergedPdfPath,
+            ]);
+
             $this->pdfMergerService->merge($allPdfFiles, $mergedPdfPath);
 
             // Проверяем, что объединенный файл создан
@@ -153,18 +276,31 @@ class MeetingApplicationGenerationService
             }
 
             $mergedFileSize = filesize($mergedPdfPath);
+            
+            Log::info('PDF merge completed', [
+                'application_id' => $application->id,
+                'merged_file_path' => $mergedPdfPath,
+                'merged_file_size' => $mergedFileSize,
+            ]);
 
             // Подсчитываем количество страниц ДО загрузки на сервер
+            Log::debug('Step 9: Counting PDF pages', [
+                'application_id' => $application->id,
+                'file_path' => $mergedPdfPath,
+            ]);
+
             $pageCount = null;
             try {
                 $pageCount = $this->pageCounterService->countPages($mergedPdfPath);
-                Log::debug('PDF pages counted before upload', [
+                Log::info('PDF pages counted', [
+                    'application_id' => $application->id,
                     'file_path' => $mergedPdfPath,
                     'page_count' => $pageCount,
                 ]);
             } catch (\Exception $e) {
                 // Логируем ошибку, но не прерываем процесс генерации
-                Log::warning('Failed to count PDF pages before upload, continuing without page count', [
+                Log::warning('Failed to count PDF pages, continuing without page count', [
+                    'application_id' => $application->id,
                     'file_path' => $mergedPdfPath,
                     'error' => $e->getMessage(),
                 ]);
@@ -179,13 +315,37 @@ class MeetingApplicationGenerationService
             $tempFiles[] = $mergedPdfPath;
 
             // 8. Удалить существующие файлы приложения (если есть)
+            Log::debug('Step 10: Deleting existing application files', [
+                'application_id' => $application->id,
+            ]);
             $deletedCount = $this->fileStorageService->deleteExistingFiles($application);
+            
+            if ($deletedCount > 0) {
+                Log::info('Existing application files deleted', [
+                    'application_id' => $application->id,
+                    'deleted_count' => $deletedCount,
+                ]);
+            }
 
             // 9. Сохранить итоговый файл
             $filename = 'meeting_application_' . $application->id . '_' . now('Europe/Moscow')->format('Y-m-d_H-i-s') . '.pdf';
 
+            Log::info('Step 11: Uploading final file', [
+                'application_id' => $application->id,
+                'filename' => $filename,
+                'file_path' => $mergedPdfPath,
+                'file_size' => $mergedFileSize,
+            ]);
+
             try {
                 $fileRecord = $this->fileStorageService->uploadFile($application, $mergedPdfPath, $filename, $userId);
+                
+                Log::info('File uploaded successfully', [
+                    'application_id' => $application->id,
+                    'file_record_id' => $fileRecord->id,
+                    'remote_path' => $fileRecord->remote_path ?? null,
+                    'file_size' => $fileRecord->size ?? null,
+                ]);
             } catch (\Exception $uploadException) {
                 // Очистка временных файлов при ошибке загрузки
                 $this->cleanupTempFiles($tempFiles);
@@ -244,45 +404,86 @@ class MeetingApplicationGenerationService
             }
 
             // Сохраняем количество страниц в meta приложения
+            Log::debug('Step 12: Saving page count to application meta', [
+                'application_id' => $application->id,
+                'page_count' => $pageCount,
+            ]);
+
             if ($pageCount !== null) {
                 $meta = $application->meta ?? [];
                 $meta['pages'] = $pageCount;
                 $application->meta = $meta;
                 $application->save();
 
-                Log::debug('PDF pages count saved to MeetingApplication meta', [
+                Log::info('Page count saved to application meta', [
                     'application_id' => $application->id,
                     'page_count' => $pageCount,
                 ]);
             }
 
             // 10. Очистить все временные файлы
+            Log::debug('Step 13: Cleaning up temporary files', [
+                'application_id' => $application->id,
+                'temp_files_count' => count($tempFiles),
+            ]);
             $this->cleanupTempFiles($tempFiles);
+            
+            Log::info('Temporary files cleaned up', [
+                'application_id' => $application->id,
+            ]);
 
             // 11. Обновить статусы и отправить уведомление
             // Проверяем наличие ошибок в файлах и сообщениях ЕФРСБ
+            Log::debug('Step 14: Checking for errors and updating application status', [
+                'application_id' => $application->id,
+            ]);
+
             $hasErrors = $this->hasErrorsInFilesOrMessages($application);
 
             if ($hasErrors) {
                 $application->latest_status = MeetingApplicationStatus::PARTIALLY_GENERATED;
                 $application->end_generation = now();
                 $application->addStatus(MeetingApplicationStatus::PARTIALLY_GENERATED, null, 'Приложение сгенерировано частично. Некоторые файлы или сообщения ЕФРСБ не были обработаны.');
+                
+                Log::info('Application status set to PARTIALLY_GENERATED', [
+                    'application_id' => $application->id,
+                ]);
             } else {
                 $application->latest_status = MeetingApplicationStatus::GENERATED;
                 $application->end_generation = now();
                 $application->addStatus(MeetingApplicationStatus::GENERATED, null, 'Приложение успешно сгенерировано');
+                
+                Log::info('Application status set to GENERATED', [
+                    'application_id' => $application->id,
+                ]);
             }
             $application->save();
 
             // Обновляем статус задачи на COMPLETED
+            Log::debug('Step 15: Updating generation task status to COMPLETED', [
+                'application_id' => $application->id,
+                'task_id' => $generationTask?->id,
+            ]);
+
             if ($generationTask) {
                 $generationTask->update([
                     'status' => MeetingApplicationGenerationTaskStatus::COMPLETED,
                     'finished_at' => now(),
                 ]);
+                
+                Log::info('Generation task completed', [
+                    'task_id' => $generationTask->id,
+                    'application_id' => $application->id,
+                ]);
             }
 
             // Отправляем уведомление через Pusher
+            Log::debug('Step 16: Sending notifications', [
+                'application_id' => $application->id,
+                'user_id' => $userId,
+                'has_errors' => $hasErrors,
+            ]);
+
             if ($userId) {
                 // Отправляем данные задачи для обновления на странице
                 event(new MeetingApplicationStatusUpdated(
@@ -300,6 +501,10 @@ class MeetingApplicationGenerationService
                         type: 'warn',
                         life: 6000
                     ));
+                    Log::info('Partial generation notification sent', [
+                        'application_id' => $application->id,
+                        'user_id' => $userId,
+                    ]);
                 } else {
                     // Полная генерация - отправляем успех
                     event(new MeetingApplicationStatusNotification(
@@ -309,11 +514,31 @@ class MeetingApplicationGenerationService
                         type: 'success',
                         life: 6000
                     ));
+                    Log::info('Success notification sent', [
+                        'application_id' => $application->id,
+                        'user_id' => $userId,
+                    ]);
                 }
             }
 
+            Log::info('Meeting application generation completed successfully', [
+                'application_id' => $application->id,
+                'status' => $application->latest_status->value,
+                'has_errors' => $hasErrors,
+            ]);
+
         } catch (\Exception $e) {
+            Log::error('Meeting application generation failed', [
+                'application_id' => $application->id ?? null,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+
             // Очистка временных файлов даже при ошибке
+            Log::debug('Cleaning up temporary files after error', [
+                'application_id' => $application->id ?? null,
+                'temp_files_count' => count($tempFiles),
+            ]);
             $this->cleanupTempFiles($tempFiles);
 
             // Получаем свежую версию приложения из БД для обновления статуса
@@ -326,6 +551,10 @@ class MeetingApplicationGenerationService
                     $application->end_generation = now();
                     $application->addStatus(MeetingApplicationStatus::ERROR, null, "Ошибка генерации: {$e->getMessage()}");
                     $application->save();
+                    
+                    Log::info('Application status set to ERROR', [
+                        'application_id' => $applicationId,
+                    ]);
                 } else {
                     Log::error('Application not found when trying to update status to ERROR', [
                         'application_id' => $applicationId,
@@ -343,6 +572,11 @@ class MeetingApplicationGenerationService
                 $generationTask->update([
                     'status' => MeetingApplicationGenerationTaskStatus::ERROR,
                     'finished_at' => now(),
+                ]);
+                
+                Log::info('Generation task status set to ERROR', [
+                    'task_id' => $generationTask->id,
+                    'application_id' => $applicationId,
                 ]);
             }
 
@@ -403,10 +637,17 @@ class MeetingApplicationGenerationService
      */
     private function downloadArbitratorFiles(MeetingApplication $application, ?MeetingApplicationGenerationTask $generationTask = null): array
     {
+        Log::debug('Starting download of arbitrator files', [
+            'application_id' => $application->id,
+        ]);
+
         $downloadedFiles = [];
         $arbitratorFiles = $application->arbitrator_files;
 
         if (!$arbitratorFiles || !$arbitratorFiles->value) {
+            Log::debug('No arbitrator files to download', [
+                'application_id' => $application->id,
+            ]);
             return $downloadedFiles;
         }
 
@@ -421,6 +662,10 @@ class MeetingApplicationGenerationService
         ];
 
         foreach ($fileTypes as $type => $modelClass) {
+            Log::debug('Processing file type', [
+                'application_id' => $application->id,
+                'file_type' => $type,
+            ]);
             $files = $arbitratorFiles->value[$type] ?? collect();
 
             // Собираем все ID файлов данного типа
@@ -498,6 +743,11 @@ class MeetingApplicationGenerationService
         // Сохраняем обновленные статусы файлов
         $application->arbitrator_files = $arbitratorFiles;
         $application->save();
+
+        Log::info('Arbitrator files download completed', [
+            'application_id' => $application->id,
+            'downloaded_count' => count($downloadedFiles),
+        ]);
 
         return $downloadedFiles;
     }
@@ -728,15 +978,29 @@ class MeetingApplicationGenerationService
      */
     private function processEfrsbMessages(MeetingApplication $application, Collection $messages, ?MeetingApplicationGenerationTask $generationTask = null): array
     {
+        Log::debug('Processing EFRSB messages', [
+            'application_id' => $application->id,
+            'messages_count' => $messages->count(),
+        ]);
+
         $messagePdfs = [];
         $messagesToRequest = [];
 
         // Разделяем сообщения на те, у которых есть body_html, и те, у которых нет
         foreach ($messages as $message) {
+            Log::debug('Processing EFRSB message', [
+                'application_id' => $application->id,
+                'message_id' => $message->id,
+                'has_body_html' => !empty($message->body_html),
+            ]);
             try {
                 // Проверяем наличие body_html
                 if (empty($message->body_html)) {
                     // Собираем сообщения для запроса
+                    Log::debug('EFRSB message needs body_html request', [
+                        'application_id' => $application->id,
+                        'message_id' => $message->id,
+                    ]);
                     $messagesToRequest[] = [
                         'message_id' => $message->id,
                         'message_uuid' => $message->uuid ?? '',
@@ -745,6 +1009,39 @@ class MeetingApplicationGenerationService
                     $this->saveMessageRequest($application->id, $message->id);
                 } else {
                     // Генерируем PDF из HTML для сообщений, у которых уже есть body_html
+                    Log::debug('Generating PDF from EFRSB message', [
+                        'application_id' => $application->id,
+                        'message_id' => $message->id,
+                    ]);
+                    
+                    // #region agent log
+                    $pendingRequest = DB::table('efrsb_message_requests')
+                        ->where('meeting_application_id', $application->id)
+                        ->where('message_id', $message->id)
+                        ->where('status', EfrsbMessageRequestStatus::PENDING->value)
+                        ->first();
+                    if ($pendingRequest) {
+                        Log::debug('Found pending request for message with body_html, cleaning up', [
+                            'application_id' => $application->id,
+                            'message_id' => $message->id,
+                            'request_id' => $pendingRequest->id ?? null,
+                        ]);
+                        // Удаляем или обновляем старый pending запрос, так как body_html уже есть
+                        DB::table('efrsb_message_requests')
+                            ->where('meeting_application_id', $application->id)
+                            ->where('message_id', $message->id)
+                            ->where('status', EfrsbMessageRequestStatus::PENDING->value)
+                            ->update([
+                                'status' => EfrsbMessageRequestStatus::COMPLETED->value,
+                                'updated_at' => now(),
+                            ]);
+                        Log::info('Pending request cleaned up for message with body_html', [
+                            'application_id' => $application->id,
+                            'message_id' => $message->id,
+                        ]);
+                    }
+                    // #endregion
+                    
                     $html = base64_decode($message->body_html, true);
                     if ($html === false) {
                         $html = $message->body_html; // Если не base64, используем как есть
@@ -757,6 +1054,12 @@ class MeetingApplicationGenerationService
                         'path' => $tempPath,
                         'message_id' => $message->id,
                     ];
+
+                    Log::info('PDF generated from EFRSB message', [
+                        'application_id' => $application->id,
+                        'message_id' => $message->id,
+                        'pdf_path' => $tempPath,
+                    ]);
 
                     // Обновляем статус сообщения на "generated"
                     $this->updateEfrsbMessageStatus($application, $message->id, 'generated');
@@ -776,13 +1079,27 @@ class MeetingApplicationGenerationService
 
         // Если есть сообщения без body_html, отправляем запрос одним пакетом
         if (!empty($messagesToRequest)) {
+            Log::info('Requesting EFRSB message bodies', [
+                'application_id' => $application->id,
+                'messages_count' => count($messagesToRequest),
+            ]);
+
             $result = $this->efrsbService->requestMessageBodies($messagesToRequest, $application->id);
 
             if ($result && ($result['success'] ?? false)) {
+                Log::info('EFRSB message bodies request sent successfully', [
+                    'application_id' => $application->id,
+                    'messages_count' => count($messagesToRequest),
+                ]);
                 // Запускаем Job для проверки таймаута
                 $timeoutMinutes = (int) config('meeting_application.efrsb_timeout_minutes', 5);
                 CheckEfrsbMessageTimeoutJob::dispatch($application->id)
                     ->delay(now()->addMinutes($timeoutMinutes));
+                
+                Log::info('EFRSB timeout job scheduled', [
+                    'application_id' => $application->id,
+                    'timeout_minutes' => $timeoutMinutes,
+                ]);
             } else {
                 Log::error('Failed to request message bodies', [
                     'messages_count' => count($messagesToRequest),
@@ -805,6 +1122,12 @@ class MeetingApplicationGenerationService
                 }
             }
         }
+
+        Log::info('EFRSB messages processing completed', [
+            'application_id' => $application->id,
+            'pdfs_generated' => count($messagePdfs),
+            'messages_requested' => count($messagesToRequest),
+        ]);
 
         return $messagePdfs;
     }
@@ -882,10 +1205,20 @@ class MeetingApplicationGenerationService
      */
     private function generatePdfsFromReadyMessages(MeetingApplication $application, Collection $messages, ?MeetingApplicationGenerationTask $generationTask = null): array
     {
+        Log::debug('Generating PDFs from ready EFRSB messages', [
+            'application_id' => $application->id,
+            'messages_count' => $messages->count(),
+        ]);
+
         $messagePdfs = [];
 
         foreach ($messages as $message) {
             try {
+                Log::debug('Processing ready EFRSB message', [
+                    'application_id' => $application->id,
+                    'message_id' => $message->id,
+                ]);
+
                 // Обновляем сообщение из БД, чтобы получить актуальный body_html
                 $message->refresh();
 
@@ -923,12 +1256,25 @@ class MeetingApplicationGenerationService
                 }
 
                 $tempPath = $this->getTempFilePath('efrsb_message_' . $message->id . '.pdf');
+                
+                Log::debug('Generating PDF from EFRSB message HTML', [
+                    'application_id' => $application->id,
+                    'message_id' => $message->id,
+                    'pdf_path' => $tempPath,
+                ]);
+
                 $this->htmlToPdfService->generate($html, $tempPath, [], $message->title ?? null);
 
                 $messagePdfs[] = [
                     'path' => $tempPath,
                     'message_id' => $message->id,
                 ];
+
+                Log::info('PDF generated from ready EFRSB message', [
+                    'application_id' => $application->id,
+                    'message_id' => $message->id,
+                    'pdf_path' => $tempPath,
+                ]);
 
                 // Обновляем статус сообщения на "generated"
                 $this->updateEfrsbMessageStatus($application, $message->id, 'generated');
@@ -944,6 +1290,11 @@ class MeetingApplicationGenerationService
                 // Продолжаем обработку остальных сообщений
             }
         }
+
+        Log::info('PDFs generation from ready EFRSB messages completed', [
+            'application_id' => $application->id,
+            'pdfs_generated' => count($messagePdfs),
+        ]);
 
         return $messagePdfs;
     }
