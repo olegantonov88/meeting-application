@@ -23,6 +23,7 @@ class PdfPageCounterService
         }
 
         // Метод 1: Пытаемся использовать FPDI (быстрый метод)
+        $pdf = null;
         try {
             $pdf = new Fpdi();
             $pageCount = $pdf->setSourceFile($filePath);
@@ -38,6 +39,13 @@ class PdfPageCounterService
                 'file_path' => $filePath,
                 'error' => $e->getMessage(),
             ]);
+        } finally {
+            if ($pdf !== null) {
+                unset($pdf);
+            }
+            if (gc_enabled()) {
+                gc_collect_cycles();
+            }
         }
 
         // Метод 2: Пытаемся использовать Ghostscript (если доступен)
