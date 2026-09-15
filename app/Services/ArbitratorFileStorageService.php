@@ -129,6 +129,20 @@ class ArbitratorFileStorageService
     }
 
     /**
+     * Провайдер хранилища управляющего по типу - для работы с файлами по пути,
+     * без записей в базе (сборка архивов для zakaznoe.pochta.ru).
+     *
+     * В отличие от getProviderForArbitrator() не глотает ошибку: причину
+     * («не настроено хранилище», «нет токена») сборка покажет пользователю.
+     *
+     * @throws \Exception
+     */
+    public function providerFor(FileStorageType $storageType, $arbitrator): \App\Services\ArbitratorFileStorage\ArbitratorFileStorageInterface
+    {
+        return $this->createProvider($storageType, $arbitrator);
+    }
+
+    /**
      * Получает провайдер для файла
      *
      * @param Model $file

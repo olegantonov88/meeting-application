@@ -120,8 +120,13 @@ class PdfPageCounterService
         file_put_contents($tempPsFile, $psCommand);
 
         try {
-            // Выполняем команду Ghostscript
-            $command = escapeshellarg($gsPath) . ' -q -dNODISPLAY ' . escapeshellarg($tempPsFile) . ' 2>&1';
+            // Выполняем команду Ghostscript.
+            // С версии 9.50 он по умолчанию работает в SAFER и не даёт PostScript открыть
+            // файл - без разрешения команда падала. Разрешаем чтение только папки этого PDF
+            $permitRead = rtrim(dirname($normalizedPath), '/') . '/';
+            $command = escapeshellarg($gsPath) . ' -q -dNODISPLAY '
+                . escapeshellarg('--permit-file-read=' . $permitRead) . ' '
+                . escapeshellarg($tempPsFile) . ' 2>&1';
 
             $output = [];
             $returnCode = 0;
@@ -131,15 +136,9 @@ class PdfPageCounterService
             @unlink($tempPsFile);
 
             if ($returnCode !== 0) {
-                $errorMessage = implode("\n", $output);
-                // Если это не критическая ошибка, пробуем извлечь число из вывода
-                if (preg_match('/(\d+)/', $errorMessage, $matches)) {
-                    $num = (int)$matches[1];
-                    if ($num > 0) {
-                        return $num;
-                    }
-                }
-                throw new \Exception("Ghostscript error: {$errorMessage}");
+                // Число из текста ошибки - номер строки или код выхода, а не страницы.
+                // Отдаём подсчёт следующему способу
+                throw new \Exception('Ghostscript error: ' . implode("\n", $output));
             }
 
             // Ищем число в выводе

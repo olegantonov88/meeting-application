@@ -31,6 +31,19 @@ return [
 
     'connections' => [
 
+        // Сборка архивов для zakaznoe.pochta.ru - отдельно от приложений к собранию.
+        // Сборка идёт минуты: с retry_after в 90 секунд её запустили бы второй раз
+        // параллельно, и она придержала бы генерацию приложений в общей очереди.
+        'zakaznoe' => [
+            'driver' => 'database',
+            'connection' => env('DB_QUEUE_CONNECTION'),
+            'table' => env('DB_QUEUE_TABLE', 'jobs'),
+            'queue' => 'zakaznoe',
+            // Больше таймаута задания (ZAKAZNOE_JOB_TIMEOUT), иначе живую сборку возьмут повторно
+            'retry_after' => (int) env('ZAKAZNOE_QUEUE_RETRY_AFTER', 4200),
+            'after_commit' => false,
+        ],
+
         'sync' => [
             'driver' => 'sync',
         ],
