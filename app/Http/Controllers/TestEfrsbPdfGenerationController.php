@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\EfrsbMessage\EfrsbDebtorMessage;
+use App\Services\EfrsbDebtorMessageService;
 use App\Services\HtmlToPdfService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
@@ -14,7 +15,8 @@ use Illuminate\Support\Str;
 class TestEfrsbPdfGenerationController extends Controller
 {
     public function __construct(
-        private HtmlToPdfService $htmlToPdfService
+        private HtmlToPdfService $htmlToPdfService,
+        private EfrsbDebtorMessageService $efrsbService,
     ) {
     }
 
@@ -45,21 +47,18 @@ class TestEfrsbPdfGenerationController extends Controller
                 ], 404);
             }
 
-            // Проверяем наличие body_html
-            if (empty($message->body_html)) {
+            // Проверяем наличие данных: html или json
+            if (!$message->hasBody()) {
                 return response()->json([
                     'success' => false,
-                    'message' => 'У сообщения отсутствует body_html',
+                    'message' => 'У сообщения нет данных (body_html или body_json)',
                     'message_id' => $messageId,
                     'message_uuid' => $message->uuid ?? null,
                 ], 400);
             }
 
-            // Декодируем HTML (может быть в base64)
-            $html = base64_decode($message->body_html, true);
-            if ($html === false) {
-                $html = $message->body_html; // Если не base64, используем как есть
-            }
+            // html как раньше, json - строим html сами
+            $html = $this->efrsbService->messageHtml($message);
 
             // Создаем временный файл для PDF
             $tempPath = $this->getTempFilePath('test_efrsb_message_' . $messageId . '.pdf');
@@ -100,6 +99,7 @@ class TestEfrsbPdfGenerationController extends Controller
                     'file_size' => $fileSize,
                     'file_size_mb' => round($fileSize / 1024 / 1024, 2),
                     'html_length' => strlen($html),
+                    'body_format' => $message->body_format?->text(),
                     'body_html_encoded' => !empty($message->body_html) && base64_decode($message->body_html, true) !== false,
                 ],
             ]);
@@ -160,6 +160,8 @@ class TestEfrsbPdfGenerationController extends Controller
                     'debtor_id' => $message->debtor_id ?? null,
                     'publish_date' => $message->publish_date?->toDateTimeString(),
                     'has_body_html' => $hasBodyHtml,
+                    'has_body' => $message->hasBody(),
+                    'body_format' => $message->body_format?->text(),
                     'body_html_length' => $htmlLength,
                     'body_html_is_base64' => $isBase64Encoded,
                     'created_at' => $message->created_at?->toDateTimeString(),

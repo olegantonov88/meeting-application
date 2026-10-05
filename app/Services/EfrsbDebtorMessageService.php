@@ -2,6 +2,9 @@
 
 namespace App\Services;
 
+use App\Enums\EfrsbMessage\EfrsbDebtorMessageBodyFormat;
+use App\Models\EfrsbMessage\EfrsbDebtorMessage;
+use App\Services\EfrsbMessageRender\EfrsbMessageRenderer;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Config;
@@ -95,5 +98,33 @@ class EfrsbDebtorMessageService
         // Этот метод будет использоваться для проверки наличия body_html в БД
         // Реализация зависит от структуры БД
         return false;
+    }
+
+    /**
+     * HTML сообщения для PDF.
+     * Данные в html - как раньше: base64, а если не декодируется - как есть.
+     * Данные в json - строим html сами в разметке Федресурса (EfrsbMessageRenderer, копия из auapp)
+     *
+     * @throws \RuntimeException если данных нет или json не разбирается
+     */
+    public function messageHtml(EfrsbDebtorMessage $message): string
+    {
+        if ($message->body_format === EfrsbDebtorMessageBodyFormat::JSON) {
+            $json = base64_decode((string) $message->body_json, true);
+            $data = json_decode($json === false ? (string) $message->body_json : $json, true);
+            if (!is_array($data)) {
+                throw new \RuntimeException('Не удалось разобрать json сообщения ЕФРСБ ' . $message->id);
+            }
+
+            return app(EfrsbMessageRenderer::class)->render($data);
+        }
+
+        if (empty($message->body_html)) {
+            throw new \RuntimeException('У сообщения ЕФРСБ ' . $message->id . ' нет данных');
+        }
+
+        $html = base64_decode($message->body_html, true);
+
+        return $html === false ? $message->body_html : $html;
     }
 }

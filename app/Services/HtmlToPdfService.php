@@ -164,6 +164,31 @@ HTML;
             max-width: 100%;
             overflow-x: hidden;
         }
+        /* Таблицы со столбцами (лоты, суд, оценщики): у Федресурса фиксированные ширины столбцов в px и отступ слева,
+           на A4 не помещаются - растягиваем на ширину страницы, ширины столбцов отдаём dompdf, длинные слова переносим */
+        .containerInfo table.lotInfo,
+        .containerInfo table.personInfo,
+        .containerInfo table.courtInfo {
+            width: 100% !important;
+            margin-left: 0 !important;
+        }
+        .containerInfo table.lotInfo th,
+        .containerInfo table.personInfo th,
+        .containerInfo table.courtInfo th {
+            width: auto !important;
+        }
+        .containerInfo td,
+        .containerInfo th {
+            word-wrap: break-word;
+        }
+        /* Подписи у Федресурса без переноса (nowrap): в браузере таблица расширяется, а dompdf сжимает столбец значений
+           в узкую полосу у края ("Дата и время начала собрания (дата окончания приема бюллетеней)").
+           В PDF подписи переносим в пределах своей ширины 202px */
+        .containerInfo td.primary,
+        .containerInfo td.primary2,
+        .containerInfo td.title {
+            white-space: normal !important;
+        }
         /* Стили для заголовка сообщения ЕФРСБ */
         h1.red_small {
             font-size: 90%;

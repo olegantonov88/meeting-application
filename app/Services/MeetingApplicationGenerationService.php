@@ -173,11 +173,10 @@ class MeetingApplicationGenerationService
                 'request_ids' => $allPendingRequests->pluck('message_id')->toArray(),
             ]);
 
-            // Проверяем, какие из pending запросов уже имеют body_html
+            // Проверяем, какие из pending запросов уже имеют данные (html или json)
             $pendingMessageIds = $allPendingRequests->pluck('message_id')->toArray();
             $messagesWithBody = EfrsbDebtorMessage::whereIn('id', $pendingMessageIds)
-                ->whereNotNull('body_html')
-                ->where('body_html', '!=', '')
+                ->withBody()
                 ->pluck('id')
                 ->toArray();
 
@@ -995,16 +994,17 @@ class MeetingApplicationGenerationService
         $messagePdfs = [];
         $messagesToRequest = [];
 
-        // Разделяем сообщения на те, у которых есть body_html, и те, у которых нет
+        // Разделяем сообщения на те, у которых есть данные (body_html или body_json), и те, у которых нет
         foreach ($messages as $message) {
             Log::debug('Processing EFRSB message', [
                 'application_id' => $application->id,
                 'message_id' => $message->id,
-                'has_body_html' => !empty($message->body_html),
+                'has_body' => $message->hasBody(),
+                'body_format' => $message->body_format?->text(),
             ]);
             try {
-                // Проверяем наличие body_html
-                if (empty($message->body_html)) {
+                // Проверяем наличие данных: html или json
+                if (!$message->hasBody()) {
                     // Собираем сообщения для запроса
                     Log::debug('EFRSB message needs body_html request', [
                         'application_id' => $application->id,
@@ -1051,10 +1051,8 @@ class MeetingApplicationGenerationService
                     }
                     // #endregion
 
-                    $html = base64_decode($message->body_html, true);
-                    if ($html === false) {
-                        $html = $message->body_html; // Если не base64, используем как есть
-                    }
+                    // html как раньше, json - строим html сами
+                    $html = $this->efrsbService->messageHtml($message);
 
                     $tempPath = $this->getTempFilePath('efrsb_message_' . $message->id . '.pdf', $application->id);
                     $this->htmlToPdfService->generate($html, $tempPath, [], $message->title ?? null);
@@ -1285,11 +1283,11 @@ class MeetingApplicationGenerationService
                     'message_id' => $message->id,
                 ]);
 
-                // Обновляем сообщение из БД, чтобы получить актуальный body_html
+                // Обновляем сообщение из БД, чтобы получить актуальные данные
                 $message->refresh();
 
-                if (empty($message->body_html)) {
-                    // Если body_html нет, проверяем статус запроса
+                if (!$message->hasBody()) {
+                    // Если данных нет, проверяем статус запроса
                     $request = DB::table('efrsb_message_requests')
                         ->where('message_id', $message->id)
                         ->first();
@@ -1316,10 +1314,8 @@ class MeetingApplicationGenerationService
                 }
 
                 // Генерируем PDF из HTML
-                $html = base64_decode($message->body_html, true);
-                if ($html === false) {
-                    $html = $message->body_html; // Если не base64, используем как есть
-                }
+                // html как раньше, json - строим html сами
+                $html = $this->efrsbService->messageHtml($message);
 
                 $tempPath = $this->getTempFilePath('efrsb_message_' . $message->id . '.pdf', $application->id);
 
